@@ -1,0 +1,4 @@
+- Keep implementation minimal and focused on Excel-to-database import workflow.
+- Use Python with Streamlit for UI and SQLAlchemy for DB access.
+- Preserve clean, structured UI sections: schema setup, dummy data reference, mapping JSON, import execution.
+- Prefer small, testable utility functions in `app/` modules.
