@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import Column, MetaData, Table, create_engine, inspect, insert
+from sqlalchemy import Column, MetaData, Table, create_engine, inspect, insert, select
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Engine
@@ -71,6 +71,23 @@ def list_tables(engine: Engine) -> list[str]:
 
 def get_table_columns(engine: Engine, table_name: str) -> list[str]:
     return [c["name"] for c in inspect(engine).get_columns(table_name)]
+
+
+def load_lookup_map(
+    engine: Engine,
+    master_table: str,
+    match_col: str,
+    return_col: str,
+) -> dict[str, Any]:
+    """
+    Load entire master table into memory as a lookup dict.
+    Returns {match_value_str: return_value} for fast O(1) lookup per row.
+    """
+    metadata = MetaData()
+    table = Table(master_table, metadata, autoload_with=engine)
+    with engine.connect() as conn:
+        rows = conn.execute(select(table.c[match_col], table.c[return_col])).fetchall()
+    return {str(row[0]): row[1] for row in rows}
 
 
 def insert_rows(

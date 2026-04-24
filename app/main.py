@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import textwrap
+import uuid
+from datetime import datetime
 from typing import Any
 
 import pandas as pd
@@ -8,10 +10,12 @@ import streamlit as st
 from sqlalchemy import text
 
 try:
-    from app.db import get_engine, insert_rows
+    from app.db import get_engine, insert_rows, list_tables, load_lookup_map
+    from app.image_extractor import ExtractedImage, extract_images_from_sheet, map_images_to_rows
     from app.sql_parser import SQLParseError, parse_insert_sql
 except ModuleNotFoundError:
-    from db import get_engine, insert_rows  # type: ignore
+    from db import get_engine, insert_rows, list_tables, load_lookup_map  # type: ignore
+    from image_extractor import ExtractedImage, extract_images_from_sheet, map_images_to_rows  # type: ignore
     from sql_parser import SQLParseError, parse_insert_sql  # type: ignore
 
 
@@ -41,16 +45,66 @@ def _safe_df(df: pd.DataFrame) -> pd.DataFrame:
     return df.astype(str)
 
 
-def _build_insert_preview(table: str, columns: list[str], rows: list[dict]) -> str:
+def resolve_autogen(pattern: str, row_index: int, ts: datetime) -> str:
+    """
+    Resolve auto-generate pattern ke nilai string.
+
+    Token yang didukung:
+      {Y}       → tahun 4 digit          2026
+      {m}       → bulan 2 digit          04
+      {d}       → hari 2 digit           23
+      {H}       → jam 2 digit            14
+      {i}       → menit 2 digit          30
+      {s}       → detik 2 digit          05
+      {YmdHis}  → YYYYmmddHHMMSS        20260423143005
+      {uuid}    → UUID4 tanpa dash       a1b2c3d4...
+      {n}       → nomor baris (1-based)  1, 2, 3 ...
+      {n:03}    → nomor baris padded     001, 002, 003 ...
+    """
+    tokens = {
+        "{Y}":       ts.strftime("%Y"),
+        "{m}":       ts.strftime("%m"),
+        "{d}":       ts.strftime("%d"),
+        "{H}":       ts.strftime("%H"),
+        "{i}":       ts.strftime("%M"),
+        "{s}":       ts.strftime("%S"),
+        "{YmdHis}": ts.strftime("%Y%m%d%H%M%S"),
+        "{uuid}":    uuid.uuid4().hex,
+        "{n}":       str(row_index),
+    }
+    result = pattern
+    for token, value in tokens.items():
+        result = result.replace(token, value)
+
+    # Handle {n:XX} zero-pad format e.g. {n:03}
+    import re
+    result = re.sub(
+        r"\{n:(\d+)\}",
+        lambda m: str(row_index).zfill(int(m.group(1))),
+        result,
+    )
+    return result
+
+
+def _build_insert_preview(
+    table: str,
+    columns: list[str],
+    rows: list[dict],
+    max_rows: int | None = 50,
+) -> str:
     col_list = ", ".join(columns)
+    subset = rows if max_rows is None else rows[:max_rows]
     lines = []
-    for row in rows[:50]:
+    for row in subset:
         vals = ", ".join(
             f"'{v}'" if v is not None else "NULL"
             for v in (row.get(c) for c in columns)
         )
         lines.append(f"  ({vals})")
-    return f"INSERT INTO {table} ({col_list}) VALUES\n" + ",\n".join(lines) + ";"
+    sql = f"INSERT INTO {table} ({col_list}) VALUES\n" + ",\n".join(lines) + ";"
+    if max_rows is not None and len(rows) > max_rows:
+        sql += f"\n-- ... dan {len(rows) - max_rows} baris lainnya (total {len(rows)} baris)"
+    return sql
 
 
 # ──────────────────────────────────────────────────────────────
@@ -154,6 +208,9 @@ def main() -> None:
     excel_df: pd.DataFrame | None = None
     excel_cols: list[str] = []
 
+    # image_rows: dict of {df_index -> ExtractedImage}, populated after upload
+    image_rows: dict[int, ExtractedImage] = {}
+
     if uploaded:
         xlsx = pd.ExcelFile(uploaded)
         selected_sheet = st.selectbox("Pilih sheet", options=xlsx.sheet_names)
@@ -161,10 +218,20 @@ def main() -> None:
         excel_df = pd.read_excel(uploaded, sheet_name=selected_sheet)
         excel_cols = list(excel_df.columns.astype(str))
 
-        stat_col1, stat_col2, stat_col3 = st.columns(3)
+        # Extract embedded images
+        try:
+            uploaded.seek(0)
+            sheet_idx = xlsx.sheet_names.index(selected_sheet)
+            extracted = extract_images_from_sheet(uploaded, sheet_name=sheet_idx)
+            image_rows = map_images_to_rows(extracted, header_row=1)
+        except Exception:
+            image_rows = {}
+
+        stat_col1, stat_col2, stat_col3, stat_col4 = st.columns(4)
         stat_col1.metric("Baris", len(excel_df))
         stat_col2.metric("Kolom", len(excel_cols))
         stat_col3.metric("Sheet", selected_sheet)
+        stat_col4.metric("Gambar terdeteksi", len(image_rows))
         st.dataframe(_safe_df(excel_df.head(5)), width="stretch")
 
     st.divider()
@@ -181,6 +248,9 @@ def main() -> None:
     if not excel_cols:
         st.info("⬆ Upload file Excel di step ② terlebih dahulu.")
         unique_cols: list[str] = []
+        autogen_patterns: dict[str, str] = {}
+        relation_configs: dict[str, dict] = {}
+        image_config: dict = {}
     else:
         st.caption(
             "Setiap baris = 1 kolom DB. Pilih kolom Excel yang sesuai dari dropdown. "
@@ -225,26 +295,308 @@ def main() -> None:
             key="unique_cols",
         )
 
+        # ── Auto-generate section ───────────────────────────
+        skipped_cols = [c for c in parsed.columns if mapping.get(c) is None]
+        st.markdown("**⚙️ Auto-generate nilai kolom**")
+        st.caption(
+            "Isi pola nilai otomatis untuk kolom yang tidak diambil dari Excel. "
+            "Didukung: `{YmdHis}` `{Y}` `{m}` `{d}` `{H}` `{i}` `{s}` `{uuid}` `{n}` `{n:03}`"
+        )
+
+        autogen_patterns: dict[str, str] = {}
+        all_db_cols = parsed.columns
+        ag_rows = [all_db_cols[i:i+2] for i in range(0, len(all_db_cols), 2)]
+        for ag_row in ag_rows:
+            ag_grid = st.columns(2)
+            for ag_idx, db_col in enumerate(ag_row):
+                with ag_grid[ag_idx]:
+                    is_skipped = mapping.get(db_col) is None
+                    pattern = st.text_input(
+                        f"{'🔁' if is_skipped else '✏️'} `{db_col}`"
+                        + (" _(tidak dari Excel)_" if is_skipped else " _(override Excel)_"),
+                        value="",
+                        placeholder=f"e.g. SMP-{{YmdHis}}-{{n:03}}" if is_skipped else "",
+                        key=f"autogen_{db_col}",
+                    )
+                    if pattern.strip():
+                        autogen_patterns[db_col] = pattern.strip()
+
+        if autogen_patterns:
+            st.caption(
+                "Preview nilai (baris ke-1): "
+                + " · ".join(
+                    f"`{c}` → `{resolve_autogen(p, 1, datetime.now())}`"
+                    for c, p in autogen_patterns.items()
+                )
+            )
+
+        # ── Relation / Foreign Key section ──────────────────
+        all_tables = list_tables(engine)
+        st.markdown("**🔗 Relasi Table (Foreign Key Lookup)**")
+        st.caption(
+            "Untuk kolom yang nilainya harus di-lookup ke table master, "
+            "atur relasi di sini. Nilai dari Excel akan diganti dengan ID dari table master."
+        )
+
+        relation_configs: dict[str, dict] = {}
+        active_mapped_cols = [c for c in parsed.columns if mapping.get(c) is not None]
+
+        if not active_mapped_cols:
+            st.info("Mapping kolom terlebih dahulu untuk mengatur relasi.")
+        elif not all_tables:
+            st.info("Belum ada table di database untuk dijadikan master.")
+        else:
+            for db_col in active_mapped_cols:
+                with st.expander(f"🔗 Relasi untuk kolom `{db_col}`", expanded=False):
+                    enable_rel = st.checkbox(
+                        "Aktifkan lookup ke table master",
+                        key=f"rel_enable_{db_col}",
+                    )
+                    if enable_rel:
+                        r_col1, r_col2, r_col3 = st.columns(3)
+                        with r_col1:
+                            master_tbl = st.selectbox(
+                                "Table master",
+                                options=all_tables,
+                                key=f"rel_tbl_{db_col}",
+                            )
+                        master_cols = []
+                        if master_tbl:
+                            try:
+                                from app.db import get_table_columns as _gtc
+                            except ModuleNotFoundError:
+                                from db import get_table_columns as _gtc  # type: ignore
+                            master_cols = _gtc(engine, master_tbl)
+                        with r_col2:
+                            match_col = st.selectbox(
+                                "Kolom pencarian (match)",
+                                options=master_cols,
+                                help="Kolom di table master yang nilainya sama dengan data Excel",
+                                key=f"rel_match_{db_col}",
+                            )
+                        with r_col3:
+                            return_col = st.selectbox(
+                                "Kolom return (ambil nilai ini)",
+                                options=master_cols,
+                                help="Kolom yang nilainya akan dimasukkan ke DB (biasanya id)",
+                                key=f"rel_return_{db_col}",
+                            )
+
+                        if master_tbl and match_col and return_col:
+                            relation_configs[db_col] = {
+                                "master_table": master_tbl,
+                                "match_col": match_col,
+                                "return_col": return_col,
+                            }
+                            # Preview sample lookup
+                            try:
+                                lmap = load_lookup_map(engine, master_tbl, match_col, return_col)
+                                sample = dict(list(lmap.items())[:5])
+                                st.caption(
+                                    f"Preview lookup `{master_tbl}` ({len(lmap)} entri): "
+                                    + " · ".join(f"`{k}` → `{v}`" for k, v in sample.items())
+                                    + (" …" if len(lmap) > 5 else "")
+                                )
+                            except Exception as exc:
+                                st.warning(f"Tidak bisa load preview: {exc}")
+
+        # ── Image Import section ────────────────────────────
+        st.markdown("**🖼️ Import Gambar dari Excel**")
+
+        image_config: dict = {}
+
+        if not image_rows:
+            st.caption("Tidak ada gambar terdeteksi di file Excel ini.")
+        else:
+            st.caption(
+                f"{len(image_rows)} gambar terdeteksi di file Excel. "
+                "Tentukan kolom DB tujuan dan format penyimpanan."
+            )
+            img_col1, img_col2, img_col3 = st.columns(3)
+            with img_col1:
+                img_enable = st.checkbox("Aktifkan import gambar", key="img_enable")
+            if img_enable:
+                with img_col2:
+                    img_db_col = st.selectbox(
+                        "Kolom DB tujuan gambar",
+                        options=parsed.columns,
+                        key="img_db_col",
+                        help="Kolom yang akan menyimpan path/base64/binary gambar",
+                    )
+                with img_col3:
+                    img_format = st.selectbox(
+                        "Format simpan",
+                        options=["base64", "path", "binary"],
+                        format_func=lambda x: {
+                            "base64": "Base64 string (TEXT/LONGTEXT)",
+                            "path": "File path (simpan ke disk)",
+                            "binary": "Binary / BLOB",
+                        }[x],
+                        key="img_format",
+                    )
+
+                name_col1, name_col2, name_col3 = st.columns(3)
+                with name_col1:
+                    img_naming_col = st.selectbox(
+                        "📛 Nama file dari kolom",
+                        options=[NONE_LABEL] + excel_cols,
+                        index=0,
+                        key="img_naming_col",
+                        help="Nilai kolom ini dipakai sebagai nama file gambar. "
+                             "Kosongkan untuk pakai nomor baris.",
+                    )
+                with name_col2:
+                    img_prefix = st.text_input(
+                        "Prefix nama file",
+                        value="",
+                        placeholder="e.g. product_",
+                        key="img_prefix",
+                    )
+                with name_col3:
+                    img_suffix = st.text_input(
+                        "Suffix nama file",
+                        value="",
+                        placeholder="e.g. _foto",
+                        key="img_suffix",
+                    )
+
+                if img_format == "path":
+                    img_save_dir = st.text_input(
+                        "Folder simpan gambar",
+                        value="uploads/images",
+                        key="img_save_dir",
+                        help="Relatif dari direktori project. Akan dibuat otomatis.",
+                    )
+                else:
+                    img_save_dir = "uploads/images"
+
+                image_config = {
+                    "enabled": True,
+                    "db_col": img_db_col,
+                    "format": img_format,
+                    "save_dir": img_save_dir,
+                    "naming_col": None if img_naming_col == NONE_LABEL else img_naming_col,
+                    "prefix": img_prefix.strip(),
+                    "suffix": img_suffix.strip(),
+                }
+
+                # Show image preview grid with naming preview
+                sample_indices = sorted(image_rows.keys())[:6]
+                if sample_indices:
+                    st.caption("Preview gambar (maks 6 baris pertama yang punya gambar):")
+                    preview_cols = st.columns(min(6, len(sample_indices)))
+                    for pi, df_idx in enumerate(sample_indices):
+                        img_obj = image_rows[df_idx]
+                        with preview_cols[pi]:
+                            # Build preview filename
+                            if image_config["naming_col"] and excel_df is not None:
+                                raw_name = str(excel_df.iloc[df_idx].get(image_config["naming_col"], df_idx + 2))
+                            else:
+                                raw_name = str(df_idx + 2)
+                            preview_name = f"{image_config['prefix']}{raw_name}{image_config['suffix']}.{img_obj.ext}"
+                            st.image(img_obj.data, use_container_width=True)
+                            st.caption(f"`{preview_name}`")
+
     st.divider()
 
     # ── Step 4: Import & Result ─────────────────────────────
     st.subheader("④ Import & Hasil Query")
 
-    if excel_df is None or not any(v is not None for v in mapping.values()):
+    has_autogen = bool(autogen_patterns) if excel_cols else False
+    if excel_df is None or (not any(v is not None for v in mapping.values()) and not has_autogen):
         st.info("Selesaikan step ② dan ③ untuk melanjutkan.")
         st.stop()
 
     active_mapping = {k: v for k, v in mapping.items() if v is not None}
-    active_cols = list(active_mapping.keys())
+    # Merge autogen + image cols into active_cols for preview
+    img_db_col_active = image_config.get("db_col") if image_config.get("enabled") else None
+    extra_cols = list(autogen_patterns.keys() if excel_cols else [])
+    if img_db_col_active:
+        extra_cols.append(img_db_col_active)
+    active_cols = list(dict.fromkeys(list(active_mapping.keys()) + extra_cols))
+
+    # Pre-load all relation lookup maps (bulk, once before row loop)
+    lookup_maps: dict[str, dict] = {}
+    rel_errors: list[str] = []
+    for db_col, rel in (relation_configs.items() if excel_cols else {}.items()):
+        try:
+            lookup_maps[db_col] = load_lookup_map(
+                engine, rel["master_table"], rel["match_col"], rel["return_col"]
+            )
+        except Exception as exc:
+            rel_errors.append(f"Lookup `{db_col}` gagal: {exc}")
+    for err in rel_errors:
+        st.warning(err)
 
     # Build target rows
+    import_ts = datetime.now()  # single timestamp for entire import batch
     all_rows: list[dict[str, Any]] = []
-    for _, source_row in excel_df.iterrows():
+    unresolved_lookup: list[tuple[int, str, Any]] = []  # (row_idx, db_col, raw_val)
+    insert_seq = 0  # sequential counter for autogen {n}, only increments for non-skipped rows
+
+    for row_idx, (_, source_row) in enumerate(excel_df.iterrows(), start=1):
+        # Skip rows where ALL mapped Excel columns are empty / NaN
+        if active_mapping and all(
+            pd.isna(source_row[excel_col])
+            for excel_col in active_mapping.values()
+        ):
+            continue
+
+        insert_seq += 1
         row: dict[str, Any] = {}
+        # 1. Values from Excel mapping
         for db_col, excel_col in active_mapping.items():
             val = source_row[excel_col]
-            row[db_col] = None if pd.isna(val) else val
+            raw = None if pd.isna(val) else val
+            # Apply relation lookup if configured
+            if db_col in lookup_maps:
+                looked_up = lookup_maps[db_col].get(str(raw))
+                if looked_up is None:
+                    unresolved_lookup.append((row_idx, db_col, raw))
+                row[db_col] = looked_up
+            else:
+                row[db_col] = raw
+        # 2. Auto-generated values
+        for db_col, pattern in (autogen_patterns.items() if excel_cols else {}.items()):
+            row[db_col] = resolve_autogen(pattern, insert_seq, import_ts)
+        # 3. Embedded image from Excel
+        if image_config.get("enabled") and image_rows:
+            df_index = row_idx - 1  # row_idx is 1-based, df_index is 0-based
+            img_obj = image_rows.get(df_index)
+            img_col_name = image_config["db_col"]
+            img_fmt = image_config["format"]
+            prefix = image_config.get("prefix", "")
+            suffix = image_config.get("suffix", "")
+            naming_col = image_config.get("naming_col")
+
+            if img_obj:
+                # Build file stem from naming column or fallback to row number
+                if naming_col and naming_col in source_row.index:
+                    raw_name = str(source_row[naming_col]).strip()
+                    # Sanitize: replace characters not safe for filenames
+                    import re as _re
+                    raw_name = _re.sub(r'[^\w\-.]', '_', raw_name)
+                else:
+                    raw_name = str(row_idx)
+                stem = f"{prefix}{raw_name}{suffix}"
+
+                if img_fmt == "base64":
+                    row[img_col_name] = img_obj.to_base64()
+                elif img_fmt == "binary":
+                    row[img_col_name] = img_obj.data
+                elif img_fmt == "path":
+                    from pathlib import Path as _Path
+                    saved = img_obj.save(image_config["save_dir"], stem)
+                    row[img_col_name] = str(saved)
+            else:
+                row[img_col_name] = None
         all_rows.append(row)
+
+    if unresolved_lookup:
+        with st.expander(f"⚠️ {len(unresolved_lookup)} nilai tidak ditemukan di table master", expanded=True):
+            st.caption("Baris berikut tidak memiliki pasangan di table master — nilai akan `NULL`.")
+            udf = pd.DataFrame(unresolved_lookup, columns=["Baris (Excel)", "Kolom DB", "Nilai tidak ditemukan"])
+            st.dataframe(_safe_df(udf), width="stretch")
 
     # ── Duplicate check ─────────────────────────────────────
     result_rows = all_rows
@@ -282,8 +634,6 @@ def main() -> None:
                 _build_insert_preview(parsed.table_name, active_cols, result_rows),
                 language="sql",
             )
-            if len(result_rows) > 50:
-                st.caption(f"… dan {len(result_rows) - 50} baris lainnya tidak ditampilkan.")
     with data_col:
         with st.expander("📋 Preview data (10 baris pertama)", expanded=True):
             st.dataframe(_safe_df(pd.DataFrame(result_rows).head(10)), width="stretch")
@@ -316,12 +666,17 @@ def main() -> None:
             st.success(f"✅ Berhasil import **{inserted} baris** ke tabel `{parsed.table_name}`.")
             st.balloons()
 
+            # Rows yang benar-benar masuk ke DB
+            confirmed_rows = result_rows[:inserted] if conflict_strategy == "skip" else result_rows
+
             res_tab1, res_tab2 = st.tabs(["📊 Data Terimport", "📝 Full INSERT Query"])
             with res_tab1:
-                st.dataframe(_safe_df(pd.DataFrame(result_rows)), width="stretch")
+                st.caption(f"Menampilkan {len(confirmed_rows)} dari {len(result_rows)} baris yang dikirim.")
+                st.dataframe(_safe_df(pd.DataFrame(confirmed_rows)), width="stretch")
             with res_tab2:
+                st.caption(f"Full INSERT query — {len(confirmed_rows)} baris.")
                 st.code(
-                    _build_insert_preview(parsed.table_name, active_cols, result_rows),
+                    _build_insert_preview(parsed.table_name, active_cols, confirmed_rows, max_rows=None),
                     language="sql",
                 )
         except Exception as exc:
