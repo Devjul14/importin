@@ -151,6 +151,8 @@ def main() -> None:
                 "Pastikan DB sudah dibuat dan user punya hak `CREATE`, `INSERT`, `SELECT`."
             )
         st.caption("Stack: Streamlit · SQLAlchemy · Pandas · PyMySQL")
+        st.divider()
+        st.caption("🧹 Gunakan menu **Cleansing Data** di sidebar untuk membersihkan Excel sebelum import.")
 
     st.title("📥 Excel → Database Import Tool")
 
