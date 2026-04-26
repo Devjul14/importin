@@ -210,31 +210,41 @@ def main() -> None:
     excel_df: pd.DataFrame | None = None
     excel_cols: list[str] = []
 
-    # image_rows: dict of {df_index -> ExtractedImage}, populated after upload
+    # image_rows cached in session_state to avoid re-processing on every rerun
     image_rows: dict[int, ExtractedImage] = {}
 
     if uploaded:
         xlsx = pd.ExcelFile(uploaded)
         selected_sheet = st.selectbox("Pilih sheet", options=xlsx.sheet_names)
-        uploaded.seek(0)
-        excel_df = pd.read_excel(uploaded, sheet_name=selected_sheet)
-        excel_cols = list(excel_df.columns.astype(str))
 
-        # Extract embedded images
-        try:
+        # Cache key: file identity + sheet — only re-process when file or sheet changes
+        cache_key = (uploaded.name, uploaded.size, selected_sheet)
+        if st.session_state.get("_excel_cache_key") != cache_key:
             uploaded.seek(0)
-            sheet_idx = xlsx.sheet_names.index(selected_sheet)
-            extracted = extract_images_from_sheet(uploaded, sheet_name=sheet_idx)
-            image_rows = map_images_to_rows(extracted, header_row=1)
-        except Exception:
-            image_rows = {}
+            excel_df_raw = pd.read_excel(uploaded, sheet_name=selected_sheet)
+            # Extract embedded images (expensive — only run once per file+sheet)
+            try:
+                uploaded.seek(0)
+                sheet_idx = xlsx.sheet_names.index(selected_sheet)
+                extracted = extract_images_from_sheet(uploaded, sheet_name=sheet_idx)
+                img_rows_raw = map_images_to_rows(extracted, header_row=1)
+            except Exception:
+                img_rows_raw = {}
+            st.session_state["_excel_cache_key"] = cache_key
+            st.session_state["_excel_df"] = excel_df_raw
+            st.session_state["_image_rows"] = img_rows_raw
+
+        excel_df = st.session_state.get("_excel_df")
+        image_rows = st.session_state.get("_image_rows", {})
+        excel_cols = list(excel_df.columns.astype(str)) if excel_df is not None else []
 
         stat_col1, stat_col2, stat_col3, stat_col4 = st.columns(4)
-        stat_col1.metric("Baris", len(excel_df))
+        stat_col1.metric("Baris", len(excel_df) if excel_df is not None else 0)
         stat_col2.metric("Kolom", len(excel_cols))
         stat_col3.metric("Sheet", selected_sheet)
         stat_col4.metric("Gambar terdeteksi", len(image_rows))
-        st.dataframe(_safe_df(excel_df.head(5)), width="stretch")
+        if excel_df is not None:
+            st.dataframe(_safe_df(excel_df.head(5)), width="stretch")
 
     st.divider()
 
@@ -683,6 +693,27 @@ def main() -> None:
                 )
         except Exception as exc:
             st.error(f"❌ Import gagal: {exc}")
+
+    # ── Reset / Clear Cache ─────────────────────────────────
+    st.divider()
+    with st.expander("🗑️ Reset & Bersihkan Memori"):
+        st.caption(
+            "Hapus data Excel dan gambar dari memori session. "
+            "Lakukan setelah import selesai untuk membebaskan RAM."
+        )
+        mem_cols = ["_excel_df", "_image_rows", "_excel_cache_key"]
+        cached_keys = [k for k in mem_cols if k in st.session_state]
+        if cached_keys:
+            img_count = len(st.session_state.get("_image_rows", {}))
+            df_rows = len(st.session_state.get("_excel_df", pd.DataFrame()))
+            st.info(f"Cache aktif: {df_rows} baris Excel + {img_count} gambar di memori.")
+        else:
+            st.info("Tidak ada data di cache session.")
+        if st.button("🗑️ Hapus cache Excel & gambar", key="btn_clear_cache"):
+            for k in mem_cols:
+                st.session_state.pop(k, None)
+            st.success("Cache dibersihkan. Upload file baru untuk memulai lagi.")
+            st.rerun()
 
 
 if __name__ == "__main__":
