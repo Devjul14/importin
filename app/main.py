@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import socket
+import sys
 import textwrap
 import uuid
 from datetime import datetime
 from typing import Any
+
+# Windows does not have AF_UNIX — patch to prevent import errors from PyMySQL
+if sys.platform == "win32" and not hasattr(socket, "AF_UNIX"):
+    socket.AF_UNIX = None  # type: ignore[attr-defined]
 
 import pandas as pd
 import streamlit as st

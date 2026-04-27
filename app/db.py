@@ -40,6 +40,14 @@ class ColumnSpec:
 
 
 def get_engine(db_url: str) -> Engine:
+    import sys
+    # On Windows, AF_UNIX is unavailable — MySQL via localhost uses Unix socket
+    # which fails. Force TCP by replacing localhost → 127.0.0.1 and stripping
+    # unix_socket query param.
+    if sys.platform == "win32" and db_url.startswith("mysql"):
+        import re
+        db_url = re.sub(r"@localhost", "@127.0.0.1", db_url)
+        db_url = re.sub(r"[?&]unix_socket=[^&]*", "", db_url)
     return create_engine(db_url, future=True)
 
 
