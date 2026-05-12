@@ -186,6 +186,28 @@ Gambar embedded di sel Excel (bukan hyperlink) otomatis diekstrak.
 
 ---
 
+## 🧾 Log Action
+
+Semua aksi penting (upload Excel, seed data, import, clear cache) dicatat ke file log JSONL.
+
+### Lihat dari UI
+- Jalankan aplikasi: `streamlit run app/main.py`
+- Buka `http://localhost:8501`
+- Scroll ke section **🧾 Log Action** untuk melihat 50 log terbaru
+
+### Lihat dari terminal
+```bash
+# 50 baris terakhir
+tail -n 50 uploads/action_log.jsonl
+
+# pantau realtime
+tail -f uploads/action_log.jsonl
+```
+
+Lokasi file log: `uploads/action_log.jsonl`
+
+---
+
 ## 📦 Dependencies
 
 ```

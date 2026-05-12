@@ -1,0 +1,7 @@
+{"timestamp": "2026-05-12T15:49:03", "action": "healthcheck", "status": "success", "payload": {"source": "cli_test"}}
+{"timestamp": "2026-05-12T15:51:12", "action": "upload_excel", "status": "success", "payload": {"file": "Salinan dari Detailing Report Konveksi BT Periode 2026.xlsx", "sheet": "Dashboard", "rows": 17, "columns": 20, "images": 0}}
+{"timestamp": "2026-05-12T15:51:35", "action": "upload_excel", "status": "success", "payload": {"file": "Salinan dari Detailing Report Konveksi BT Periode 2026.xlsx", "sheet": "Copy of Perhitungan Penggunaan ", "rows": 928, "columns": 2, "images": 0}}
+{"timestamp": "2026-05-12T15:51:55", "action": "import_rows", "status": "error", "payload": {"table": "m_produk_bom", "sent": 928, "strategy": "skip", "error": "m_produk_bom"}}
+{"timestamp": "2026-05-12T15:57:19", "action": "import_rows", "status": "success", "payload": {"table": "m_produk_bom", "sent": 928, "inserted": 1, "skipped": 927, "strategy": "skip"}}
+{"timestamp": "2026-05-12T16:07:21", "action": "upload_excel", "status": "success", "payload": {"file": "Salinan dari Detailing Report Konveksi BT Periode 2026.xlsx", "sheet": "Copy of Perhitungan Penggunaan ", "rows": 928, "columns": 2, "images": 0}}
+{"timestamp": "2026-05-12T16:07:43", "action": "upload_excel", "status": "success", "payload": {"file": "Salinan dari Detailing Report Konveksi BT Periode 2026.xlsx", "sheet": "Perhitungan Penggunaan BB", "rows": 930, "columns": 33, "images": 0}}

@@ -4,6 +4,7 @@ import socket
 import sys
 import textwrap
 import uuid
+import json
 from datetime import datetime
 from typing import Any
 
@@ -16,10 +17,12 @@ import streamlit as st
 from sqlalchemy import text
 
 try:
+    from app.action_log import log_action, read_action_logs
     from app.db import get_engine, insert_rows, list_tables, load_lookup_map
     from app.image_extractor import ExtractedImage, extract_images_from_sheet, map_images_to_rows
     from app.sql_parser import SQLParseError, parse_insert_sql
 except ModuleNotFoundError:
+    from action_log import log_action, read_action_logs  # type: ignore
     from db import get_engine, insert_rows, list_tables, load_lookup_map  # type: ignore
     from image_extractor import ExtractedImage, extract_images_from_sheet, map_images_to_rows  # type: ignore
     from sql_parser import SQLParseError, parse_insert_sql  # type: ignore
@@ -201,10 +204,20 @@ def main() -> None:
             if st.button("💾 Seed dummy data ke DB", help="Insert baris dari SQL ke database (opsional)."):
                 try:
                     n, skipped = insert_rows(engine, parsed.table_name, parsed.sample_rows, conflict_strategy="skip")
+                    log_action(
+                        "seed_dummy_data",
+                        status="success",
+                        payload={"table": parsed.table_name, "inserted": n, "skipped": skipped},
+                    )
                     if skipped:
                         st.warning(f"{skipped} baris dilewati (sudah ada).")
                     st.success(f"{n} baris dummy berhasil dimasukkan ke `{parsed.table_name}`.)")
                 except Exception as exc:
+                    log_action(
+                        "seed_dummy_data",
+                        status="error",
+                        payload={"table": parsed.table_name, "error": str(exc)},
+                    )
                     st.error(f"Gagal seed: {exc}")
 
     st.divider()
@@ -239,6 +252,17 @@ def main() -> None:
             st.session_state["_excel_cache_key"] = cache_key
             st.session_state["_excel_df"] = excel_df_raw
             st.session_state["_image_rows"] = img_rows_raw
+            log_action(
+                "upload_excel",
+                status="success",
+                payload={
+                    "file": uploaded.name,
+                    "sheet": selected_sheet,
+                    "rows": len(excel_df_raw),
+                    "columns": len(excel_df_raw.columns),
+                    "images": len(img_rows_raw),
+                },
+            )
 
         excel_df = st.session_state.get("_excel_df")
         image_rows = st.session_state.get("_image_rows", {})
@@ -679,6 +703,17 @@ def main() -> None:
             inserted, skipped = insert_rows(
                 engine, parsed.table_name, result_rows, conflict_strategy=conflict_strategy
             )
+            log_action(
+                "import_rows",
+                status="success",
+                payload={
+                    "table": parsed.table_name,
+                    "sent": len(result_rows),
+                    "inserted": inserted,
+                    "skipped": skipped,
+                    "strategy": conflict_strategy,
+                },
+            )
             if skipped:
                 st.warning(f"⚠️ {skipped} baris dilewati (duplicate/conflict).")
             st.success(f"✅ Berhasil import **{inserted} baris** ke tabel `{parsed.table_name}`.")
@@ -698,7 +733,31 @@ def main() -> None:
                     language="sql",
                 )
         except Exception as exc:
+            log_action(
+                "import_rows",
+                status="error",
+                payload={
+                    "table": parsed.table_name,
+                    "sent": len(result_rows),
+                    "strategy": conflict_strategy,
+                    "error": str(exc),
+                },
+            )
             st.error(f"❌ Import gagal: {exc}")
+
+    st.divider()
+    st.subheader("🧾 Log Action")
+    st.caption("Menampilkan 50 action terbaru dari file log aplikasi.")
+    logs = read_action_logs(limit=50)
+    if logs:
+        log_df = pd.DataFrame(logs)
+        if "payload" in log_df.columns:
+            log_df["payload"] = log_df["payload"].apply(
+                lambda p: json.dumps(p, ensure_ascii=False) if isinstance(p, dict) else str(p)
+            )
+        st.dataframe(_safe_df(log_df.iloc[::-1]), width="stretch")
+    else:
+        st.info("Belum ada log action.")
 
     # ── Reset / Clear Cache ─────────────────────────────────
     st.divider()
@@ -718,6 +777,7 @@ def main() -> None:
         if st.button("🗑️ Hapus cache Excel & gambar", key="btn_clear_cache"):
             for k in mem_cols:
                 st.session_state.pop(k, None)
+            log_action("clear_cache", status="success", payload={"keys": mem_cols})
             st.success("Cache dibersihkan. Upload file baru untuk memulai lagi.")
             st.rerun()
 
