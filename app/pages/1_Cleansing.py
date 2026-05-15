@@ -19,16 +19,18 @@ try:
         coerce_datetime, coerce_numeric, drop_duplicates,
         drop_empty_columns, drop_empty_rows, fill_missing, find_replace,
         load_excel_unmerged, normalize_whitespace, null_summary,
-        rename_columns, select_columns, split_column, to_csv_bytes,
+        rename_columns, select_columns, split_column, strip_unit, to_csv_bytes,
         to_excel_bytes, to_lowercase, to_titlecase, to_uppercase, trim_whitespace,
+        unpivot,
     )
 except ModuleNotFoundError:
     from cleansing import (  # type: ignore
         coerce_datetime, coerce_numeric, drop_duplicates,
         drop_empty_columns, drop_empty_rows, fill_missing, find_replace,
         load_excel_unmerged, normalize_whitespace, null_summary,
-        rename_columns, select_columns, split_column, to_csv_bytes,
+        rename_columns, select_columns, split_column, strip_unit, to_csv_bytes,
         to_excel_bytes, to_lowercase, to_titlecase, to_uppercase, trim_whitespace,
+        unpivot,
     )
 
 st.set_page_config(page_title="Cleansing Data", page_icon="🧹", layout="wide")
@@ -49,6 +51,13 @@ def _push(label: str, df: pd.DataFrame) -> None:
 
 
 def _safe(df: pd.DataFrame) -> pd.DataFrame:
+    # Rename duplicate column names before converting (PyArrow requires unique cols)
+    cols = pd.Series(df.columns.astype(str))
+    for dup in cols[cols.duplicated()].unique():
+        mask = cols == dup
+        cols[mask] = [dup if i == 0 else f"{dup}.{i}" for i, _ in enumerate(mask[mask].index)]
+    df = df.copy()
+    df.columns = cols.tolist()
     return df.astype(str).replace("nan", "").replace("<NA>", "")
 
 
@@ -128,6 +137,7 @@ tabs = st.tabs([
     "🔍 Find & Replace",
     "❓ Isi Missing",
     "✂️ Split Kolom",
+    "🔄 Unpivot",
 ])
 
 # ────── TAB 1: Select columns ──────────────────────────────────────────────────
@@ -346,6 +356,99 @@ with tabs[8]:
             _push(f"Split `{sp_col}` → {names}", new_df)
             st.success(f"Kolom `{sp_col}` dipecah menjadi {len(names)} kolom.")
             st.rerun()
+
+# ────── TAB 10: Unpivot ───────────────────────────────────────────────────────
+with tabs[9]:
+    st.markdown(
+        "**Ubah format wide → long** (unpivot / melt). "
+        "Cocok untuk tabel BOM di mana setiap kolom adalah kode bahan baku."
+    )
+    st.caption(
+        "Contoh: kolom `Nama Barang | BB00022 | BB00003 | ...` "
+        "→ baris `nama_barang | kode_bahan_baku | qty`"
+    )
+
+    uv_id_cols = st.multiselect(
+        "📌 Kolom ID (tetap — tidak di-unpivot)",
+        df.columns.tolist(),
+        default=[df.columns[0]] if len(df.columns) > 0 else [],
+        key="t_uv_id",
+        help="Pilih kolom yang menjadi identitas baris, misal: Nama Barang, SKU, dll.",
+    )
+
+    remaining_cols = [c for c in df.columns if c not in uv_id_cols]
+    uv_val_cols = st.multiselect(
+        "📊 Kolom yang di-unpivot (nilai)",
+        remaining_cols,
+        default=remaining_cols,
+        key="t_uv_vals",
+        help="Pilih kolom bahan baku / material. Header kolom akan jadi value di kolom baru.",
+    )
+
+    c1, c2 = st.columns(2)
+    with c1:
+        uv_var_name = st.text_input(
+            "Nama kolom baru — header asli",
+            value="kode_bahan_baku",
+            key="t_uv_varname",
+        )
+    with c2:
+        uv_val_name = st.text_input(
+            "Nama kolom baru — nilai",
+            value="qty",
+            key="t_uv_valname",
+        )
+
+    c3, c4, c5, c6 = st.columns(4)
+    with c3:
+        uv_drop_null = st.checkbox("Hapus baris dengan nilai NULL", value=True, key="t_uv_null")
+    with c4:
+        uv_drop_dash = st.checkbox("Hapus baris dengan nilai ' -' / '-'", value=True, key="t_uv_dash")
+    with c5:
+        uv_strip_unit = st.checkbox(
+            "Hapus satuan (cm / Yrd / Pcs dll)",
+            value=True,
+            key="t_uv_strip",
+            help="Contoh: '150 cm' → 150, '2743 Yrd' → 2743, '30 Pcs' → 30",
+        )
+    with c6:
+        uv_sort = st.checkbox(
+            "Urutkan per produk",
+            value=True,
+            key="t_uv_sort",
+            help="Kelompokkan baris per Nama Barang sehingga semua bahan baku tiap produk berurutan.",
+        )
+
+    if uv_id_cols and uv_val_cols:
+        preview_melt = unpivot(
+            df,
+            id_cols=uv_id_cols,
+            value_cols=uv_val_cols,
+            var_name=uv_var_name or "kode_bahan_baku",
+            value_name=uv_val_name or "qty",
+            drop_null_values=uv_drop_null,
+            drop_dash_values=uv_drop_dash,
+            strip_units=uv_strip_unit,
+            sort_by_id=uv_sort,
+        )
+        st.caption(
+            f"Preview hasil unpivot: **{len(preview_melt)} baris** × **{len(preview_melt.columns)} kolom** "
+            f"(dari {len(df)} baris × {len(df.columns)} kolom)"
+        )
+        st.dataframe(_safe(preview_melt.head(20)), use_container_width=True)
+
+        if st.button("🔄 Terapkan Unpivot", key="btn_unpivot", type="primary"):
+            _push(
+                f"Unpivot {len(uv_val_cols)} kolom → [{uv_var_name}, {uv_val_name}]",
+                preview_melt,
+            )
+            st.success(
+                f"Unpivot selesai: {len(preview_melt)} baris · "
+                f"kolom: {', '.join(preview_melt.columns.tolist())}"
+            )
+            st.rerun()
+    else:
+        st.info("Pilih minimal 1 kolom ID dan 1 kolom nilai untuk melanjutkan.")
 
 # ─── History & Undo ───────────────────────────────────────────────────────────
 st.divider()

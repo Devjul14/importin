@@ -333,9 +333,117 @@ def null_summary(df: pd.DataFrame) -> pd.DataFrame:
     """Return per-column null count and percentage."""
     counts = df.isna().sum()
     pct = (counts / len(df) * 100).round(1)
+    # Use iloc-based dtype lookup to avoid issues with duplicate column names
+    dtypes = [str(df.iloc[:, i].dtype) for i in range(len(df.columns))]
     return pd.DataFrame({
-        "Kolom": counts.index,
+        "Kolom": [str(c) for c in df.columns],
         "Null Count": counts.values,
         "Null %": pct.values,
-        "Dtype": [str(df[c].dtype) for c in counts.index],
+        "Dtype": dtypes,
     })
+
+
+# ─────────────────────────────────────────────
+# Unpivot (melt / wide → long)
+# ─────────────────────────────────────────────
+
+def strip_unit(series: pd.Series) -> pd.Series:
+    """
+    Hapus satuan dari nilai string numerik.
+    Contoh: '150 cm' -> '150', '2743 Yrd' -> '2743', '30 Pcs' -> '30'.
+    Nilai yang tidak mengandung angka akan menjadi NaN.
+    """
+    extracted = series.astype(str).str.extract(r'^\s*([\d.,]+)', expand=False)
+    return pd.to_numeric(extracted.str.replace(',', '', regex=False), errors='coerce')
+
+
+def unpivot(
+    df: pd.DataFrame,
+    id_cols: list[str],
+    value_cols: list[str],
+    var_name: str = "kode_bahan_baku",
+    value_name: str = "qty",
+    drop_null_values: bool = True,
+    drop_dash_values: bool = True,
+    strip_units: bool = False,
+    sort_by_id: bool = True,
+) -> pd.DataFrame:
+    """
+    Ubah format wide → long (unpivot).
+
+    Parameters
+    ----------
+    id_cols         : kolom yang tetap (misal: ['Nama Barang'])
+    value_cols      : kolom yang akan di-unpivot (misal: ['BB00022', 'BB00003', ...])
+    var_name        : nama kolom baru untuk header asli (kode bahan baku)
+    value_name      : nama kolom baru untuk nilai (qty)
+    drop_null_values: hapus baris di mana nilai NULL setelah melt
+    drop_dash_values: hapus baris di mana nilai adalah ' -', '-', atau string dash
+    """
+    # Work on a positional copy to handle duplicate column names safely.
+    # For each selected name in value_cols, collect ALL positional occurrences
+    # in the original DataFrame (multiselect only returns unique names).
+    sub = df[id_cols].copy()
+    col_list = df.columns.tolist()
+
+    # Build ordered list of (internal_name, position, original_name)
+    entries: list[tuple[str, int, str]] = []
+    used_positions: set[int] = set()
+    selected_set = list(dict.fromkeys(str(c) for c in value_cols))  # preserve order, unique
+
+    for col_name in selected_set:
+        # collect all positions for this column name
+        positions = [pos for pos, c in enumerate(col_list) if str(c) == col_name]
+        for i, pos in enumerate(positions):
+            if pos in used_positions:
+                continue
+            internal = col_name if i == 0 else f"{col_name}__{i}"
+            entries.append((internal, pos, col_name))
+            used_positions.add(pos)
+
+    internal_names = [e[0] for e in entries]
+    original_names = [e[2] for e in entries]
+
+    for internal, pos, _ in entries:
+        sub[internal] = df.iloc[:, pos].values
+
+    # Avoid conflict between var_name/value_name and existing columns
+    all_cols = set(sub.columns.tolist())
+    safe_var = var_name
+    while safe_var in all_cols:
+        safe_var = safe_var + "_"
+    safe_val = value_name
+    while safe_val in all_cols:
+        safe_val = safe_val + "_"
+
+    melted = sub.melt(
+        id_vars=id_cols,
+        value_vars=internal_names,
+        var_name=safe_var,
+        value_name=safe_val,
+    ).reset_index(drop=True)
+
+    # Map internal names back to original names in the var column
+    name_map = dict(zip(internal_names, original_names))
+    melted[safe_var] = melted[safe_var].map(name_map).fillna(melted[safe_var])
+
+    # Rename safe_var / safe_val back to intended names
+    melted = melted.rename(columns={safe_var: var_name, safe_val: value_name})
+
+    if drop_null_values:
+        melted = melted[melted[value_name].notna()]
+
+    if drop_dash_values:
+        # strip whitespace then drop cells that are only dashes or empty
+        mask = melted[value_name].astype(str).str.strip().isin(["-", "--", "", "nan", "None"])
+        melted = melted[~mask]
+
+    if strip_units:
+        melted[value_name] = strip_unit(melted[value_name])
+        if drop_null_values:
+            melted = melted[melted[value_name].notna()]
+
+    if sort_by_id and id_cols:
+        melted = melted.sort_values(by=id_cols, kind="stable").reset_index(drop=True)
+
+    return melted.reset_index(drop=True)
