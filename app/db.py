@@ -175,3 +175,55 @@ def insert_rows(
             return inserted_count, skipped_count
 
     raise ValueError(f"Unknown conflict_strategy: {conflict_strategy}")
+
+
+def bulk_update_by_join(
+    engine: Engine,
+    table_name: str,
+    rows: list[dict[str, Any]],
+    join_col: str,
+    update_cols: list[str],
+) -> tuple[int, int]:
+    """
+    Bulk UPDATE rows in *table_name* by matching on *join_col*.
+
+    For each row in *rows*:
+      UPDATE table_name
+         SET col1 = :col1, col2 = :col2, …
+       WHERE join_col = :join_col_val
+
+    Returns (updated, not_found) counts.
+    """
+    if not rows:
+        return 0, 0
+
+    metadata = MetaData()
+    tbl = Table(table_name, metadata, autoload_with=engine)
+
+    updated = 0
+    not_found = 0
+
+    set_clause = {c: tbl.c[c] for c in update_cols if c in tbl.c}
+    if not set_clause:
+        raise ValueError(f"None of update_cols {update_cols} exist in table {table_name}")
+
+    from sqlalchemy import update as sa_update
+
+    with engine.begin() as conn:
+        for row in rows:
+            join_val = row.get(join_col)
+            if join_val is None:
+                not_found += 1
+                continue
+            stmt = (
+                sa_update(tbl)
+                .where(tbl.c[join_col] == join_val)
+                .values({c: row.get(c) for c in update_cols})
+            )
+            result = conn.execute(stmt)
+            if result.rowcount and result.rowcount > 0:
+                updated += result.rowcount
+            else:
+                not_found += 1
+
+    return updated, not_found
