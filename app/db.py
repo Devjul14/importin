@@ -154,10 +154,11 @@ def insert_rows(
             return len(rows), 0
         elif dialect == "mysql":
             base = mysql_insert(table)
+            inserted_cols = set(rows[0].keys())
             update_cols = {
                 c.name: base.inserted[c.name]
                 for c in table.columns
-                if not c.primary_key
+                if not c.primary_key and c.name in inserted_cols
             }
             stmt = base.on_duplicate_key_update(**update_cols) if update_cols else base.prefix_with("IGNORE")
             with engine.begin() as conn:
