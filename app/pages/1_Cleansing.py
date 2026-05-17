@@ -442,6 +442,9 @@ with tabs[9]:
                 f"Unpivot {len(uv_val_cols)} kolom → [{uv_var_name}, {uv_val_name}]",
                 preview_melt,
             )
+            # Clear widget state so multiselects reset to defaults on next rerun
+            for _k in ["t_uv_id", "t_uv_vals"]:
+                st.session_state.pop(_k, None)
             st.success(
                 f"Unpivot selesai: {len(preview_melt)} baris · "
                 f"kolom: {', '.join(preview_melt.columns.tolist())}"

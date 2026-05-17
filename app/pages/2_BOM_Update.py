@@ -11,10 +11,10 @@ import streamlit as st
 from sqlalchemy import text
 
 try:
-    from app.db import get_engine, get_table_columns, list_tables, bulk_update_by_join
+    from app.db import get_engine, get_table_columns, list_tables, bulk_update_by_join, bom_replace_by_join
     from app.action_log import log_action
 except ModuleNotFoundError:
-    from db import get_engine, get_table_columns, list_tables, bulk_update_by_join  # type: ignore
+    from db import get_engine, get_table_columns, list_tables, bulk_update_by_join, bom_replace_by_join  # type: ignore
     from action_log import log_action  # type: ignore
 
 NONE_LABEL = "— skip —"
@@ -30,6 +30,38 @@ def _get_engine(db_url: str):
 
 def _safe(df: pd.DataFrame) -> pd.DataFrame:
     return df.astype(str)
+
+
+def _get_col_types(eng, table: str) -> dict[str, str]:
+    """Return {col_name: mysql_type_str} using INFORMATION_SCHEMA."""
+    dialect = eng.dialect.name
+    if dialect == "mysql":
+        sql = text(
+            "SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS "
+            "WHERE TABLE_NAME = :tbl AND TABLE_SCHEMA = DATABASE()"
+        )
+        with eng.connect() as conn:
+            rows = conn.execute(sql, {"tbl": table}).fetchall()
+        return {r[0]: r[1].lower() for r in rows}
+    # SQLite fallback via PRAGMA
+    with eng.connect() as conn:
+        rows = conn.execute(text(f"PRAGMA table_info({table})")).fetchall()
+    return {r[1]: r[2].lower() for r in rows}
+
+
+_INTEGER_TYPES = {"int", "integer", "bigint", "smallint", "tinyint", "mediumint"}
+
+
+def _series_is_non_numeric(series: pd.Series) -> bool:
+    """Return True if the column contains at least one non-numeric string value."""
+    sample = series.dropna().astype(str)
+    if sample.empty:
+        return False
+    try:
+        pd.to_numeric(sample, errors="raise")
+        return False
+    except (ValueError, TypeError):
+        return True
 
 
 # ──────────────────────────────────────────────────────────────
@@ -98,6 +130,53 @@ update_cols_db: list[str] = st.multiselect(
 if not update_cols_db:
     st.info("Pilih minimal satu kolom untuk di-update.")
     st.stop()
+
+# ── Schema type check ─────────────────────────────────────────
+with st.expander("🔧 Cek & Perbaiki Tipe Kolom DB", expanded=False):
+    st.caption(
+        "Periksa apakah tipe kolom DB kompatibel dengan data Excel. "
+        "Jika kolom DB bertipe INT namun data adalah string (misal `BB00012`), "
+        "klik **ALTER** untuk mengubah tipe ke `VARCHAR(100)`."
+    )
+    try:
+        col_types = _get_col_types(engine, target_table)
+        type_rows = []
+        for c in [join_col_db] + update_cols_db:
+            db_type = col_types.get(c, "unknown")
+            type_rows.append({"Kolom DB": c, "Tipe Saat Ini": db_type})
+        st.dataframe(_safe(pd.DataFrame(type_rows)), use_container_width=True, hide_index=True)
+
+        int_update_cols = [
+            c for c in update_cols_db
+            if any(t in col_types.get(c, "") for t in _INTEGER_TYPES)
+        ]
+        if int_update_cols:
+            st.warning(
+                f"⚠️ Kolom berikut bertipe INTEGER di DB: "
+                + ", ".join(f"`{c}`" for c in int_update_cols)
+                + ". Jika data Excel berupa teks (misal `BB00001`), UPDATE akan gagal."
+            )
+            alter_col = st.selectbox(
+                "Pilih kolom yang ingin di-ALTER ke VARCHAR(100)",
+                options=int_update_cols,
+                key="alter_col_select",
+            )
+            alter_len = st.number_input("Panjang VARCHAR", min_value=10, max_value=500, value=100, step=10, key="alter_len")
+            if st.button(f"⚡ ALTER `{alter_col}` → VARCHAR({int(alter_len)})", key="btn_alter"):
+                try:
+                    with engine.begin() as conn:
+                        conn.execute(text(
+                            f"ALTER TABLE {target_table} "
+                            f"MODIFY COLUMN {alter_col} VARCHAR({int(alter_len)})"
+                        ))
+                    st.success(f"✅ Kolom `{alter_col}` berhasil diubah ke VARCHAR({int(alter_len)}). Refresh halaman untuk melihat tipe terbaru.")
+                    st.cache_resource.clear()
+                except Exception as exc:
+                    st.error(f"ALTER gagal: {exc}")
+        else:
+            st.success("✅ Semua tipe kolom terlihat kompatibel.")
+    except Exception as exc:
+        st.warning(f"Tidak bisa cek tipe kolom: {exc}")
 
 st.divider()
 
@@ -190,29 +269,115 @@ for _, src in excel_df.iterrows():
         row[db_col] = None if pd.isna(val) else val
     rows_to_update.append(row)
 
-st.info(f"**{len(rows_to_update)}** baris dari Excel siap di-update ke `{target_table}` via `{join_col_db}`.")
+# ── Match check against DB ─────────────────────────────────────
+if rows_to_update:
+    excel_unique = list({r[join_col_db] for r in rows_to_update})
+    try:
+        from sqlalchemy import MetaData as _Meta, Table as _Tbl, select as _sel
+        _meta = _Meta()
+        _tbl = _Tbl(target_table, _meta, autoload_with=engine)
+        with engine.connect() as _conn:
+            db_vals = {
+                str(r[0])
+                for r in _conn.execute(_sel(_tbl.c[join_col_db])).fetchall()
+            }
+        matched = [v for v in excel_unique if v in db_vals]
+        unmatched = [v for v in excel_unique if v not in db_vals]
+        mc1, mc2 = st.columns(2)
+        mc1.metric("✅ Produk cocok (akan diproses)", len(matched))
+        mc2.metric("⚠️ Produk tidak ditemukan di DB", len(unmatched))
+        if unmatched:
+            with st.expander(f"🔎 {len(unmatched)} nama produk tidak ada di DB (akan dilewati)"):
+                st.dataframe(pd.DataFrame({join_col_db: unmatched}), use_container_width=True, hide_index=True)
+        if not matched:
+            st.error(
+                f"❌ Tidak ada satu pun `{join_col_db}` dari Excel yang cocok dengan data di DB. "
+                "Pastikan kolom join sudah benar dan DB URL sudah terhubung ke database yang tepat."
+            )
+            st.stop()
+    except Exception as _exc:
+        st.warning(f"Tidak bisa cek kecocokan: {_exc}")
+
+st.info(f"**{len(rows_to_update)}** baris dari Excel siap diproses ke `{target_table}` via `{join_col_db}`.")
+
+# ── Strategy selector ─────────────────────────────────────────
+strategy = st.radio(
+    "Strategi import:",
+    options=["replace", "update"],
+    format_func=lambda x: {
+        "replace": "♻️ Delete lama → Insert baru  (aman untuk multi-baris per produk & unique key)",
+        "update":  "✏️ UPDATE per baris  (cocok jika 1 baris per produk, tanpa unique constraint)",
+    }[x],
+    index=0,
+    key="upd_strategy",
+)
+
+carry_cols: list[str] = []
+delete_col: str | None = None
+if strategy == "replace":
+    st.caption(
+        "Mode **Delete → Insert**: baris lama untuk produk yang ada di Excel dihapus, "
+        "lalu baris baru di-insert dengan `id_produk` diambil otomatis dari DB. "
+        "Produk yang tidak ditemukan di DB akan **dilewati** (tidak dihapus, tidak diinsert)."
+    )
+    rc1, rc2 = st.columns(2)
+    with rc1:
+        carry_candidates = [c for c in table_cols if c not in mapped_update_cols and c != join_col_db]
+        carry_cols = st.multiselect(
+            "Kolom carry-over dari DB",
+            options=carry_candidates,
+            default=[c for c in ["id_produk", "created_by", "created_at"] if c in carry_candidates],
+            help="Kolom yang diambil dari baris lama sebelum delete, lalu disertakan di INSERT baru.",
+            key="upd_carry_cols",
+        )
+    with rc2:
+        delete_col_options = ["(sama dengan join col)"] + [c for c in carry_cols if c in table_cols]
+        delete_col_sel = st.selectbox(
+            "DELETE by kolom",
+            options=delete_col_options,
+            index=1 if "id_produk" in carry_cols else 0,
+            help="Gunakan id_produk untuk DELETE agar lebih aman dari konflik unique key.",
+            key="upd_delete_col",
+        )
+        delete_col = None if delete_col_sel == "(sama dengan join col)" else delete_col_sel
 
 # Preview table
 preview_df = pd.DataFrame(rows_to_update)
-with st.expander("🔍 Preview data yang akan diupdate (maks 50 baris)", expanded=True):
+with st.expander("🔍 Preview data yang akan diproses (maks 50 baris)", expanded=True):
     st.dataframe(_safe(preview_df.head(50)), use_container_width=True)
 
-# Show sample UPDATE SQL
+# Show sample SQL
 if rows_to_update:
     sample = rows_to_update[0]
-    set_part = ", ".join(f"{c} = '{sample.get(c)}'" for c in mapped_update_cols)
-    sample_sql = (
-        f"UPDATE {target_table}\n"
-        f"   SET {set_part}\n"
-        f" WHERE {join_col_db} = '{sample[join_col_db]}';\n"
-        f"-- ... ({len(rows_to_update)} total statements)"
-    )
-    with st.expander("📝 Contoh SQL UPDATE"):
+    if strategy == "replace":
+        unique_names = list({r[join_col_db] for r in rows_to_update})[:3]
+        del_col_display = delete_col if delete_col else join_col_db
+        in_list = ", ".join(f"'{v}'" for v in unique_names)
+        col_list = ", ".join([join_col_db] + mapped_update_cols + [c for c in carry_cols if c != join_col_db])
+        val_ex = ", ".join([f"'{sample.get(c, '?')}'" for c in [join_col_db] + mapped_update_cols])
+        sample_sql = (
+            f"-- Step 1: Lookup id_produk by nama_produk (internal)\n\n"
+            f"-- Step 2: Hapus baris lama by {del_col_display}\n"
+            f"DELETE FROM {target_table} WHERE {del_col_display} IN (id1, id2, ...);\n\n"
+            f"-- Step 3: Insert baris baru ({join_col_db} sebagai referensi + id_produk dari carry)\n"
+            f"INSERT INTO {target_table} ({col_list}) VALUES ({val_ex}, ...carry...);\n"
+            f"-- Total: {len(rows_to_update)} baris dari {len(set(r[join_col_db] for r in rows_to_update))} produk"
+        )
+    else:
+        set_part = ", ".join(f"{c} = '{sample.get(c)}'" for c in mapped_update_cols)
+        sample_sql = (
+            f"UPDATE {target_table}\n"
+            f"   SET {set_part}\n"
+            f" WHERE {join_col_db} = '{sample[join_col_db]}';\n"
+            f"-- ... ({len(rows_to_update)} total statements)"
+        )
+    with st.expander("📝 Contoh SQL"):
         st.code(sample_sql, language="sql")
 
 # Execute
 update_btn = st.button(
-    f"🚀 Eksekusi UPDATE {len(rows_to_update)} baris ke `{target_table}`",
+    f"🚀 Eksekusi {'Delete+Insert' if strategy == 'replace' else 'UPDATE'} "
+    f"{len(rows_to_update)} baris ke `{target_table}`",
     type="primary",
     use_container_width=True,
     key="upd_execute",
@@ -220,7 +385,49 @@ update_btn = st.button(
 
 if update_btn:
     if not rows_to_update:
-        st.error("Tidak ada data untuk diupdate.")
+        st.error("Tidak ada data untuk diproses.")
+    elif strategy == "replace":
+        try:
+            inserted, skipped, not_found_vals = bom_replace_by_join(
+                engine,
+                table_name=target_table,
+                rows=rows_to_update,
+                join_col=join_col_db,
+                carry_cols=carry_cols,
+                delete_col=delete_col,
+            )
+            log_action(
+                "bom_replace_by_join",
+                status="success",
+                payload={
+                    "table": target_table,
+                    "join_col": join_col_db,
+                    "delete_col": delete_col,
+                    "carry_cols": carry_cols,
+                    "sent": len(rows_to_update),
+                    "inserted": inserted,
+                    "skipped": skipped,
+                    "not_found_count": len(not_found_vals),
+                },
+            )
+            st.success(f"✅ **{inserted} baris** berhasil di-insert ke `{target_table}`.")
+            if skipped:
+                st.warning(
+                    f"⚠️ **{skipped} baris** dilewati karena `{join_col_db}` tidak ditemukan di DB:"
+                )
+                with st.expander(f"🔎 {len(not_found_vals)} nama produk tidak ditemukan di DB"):
+                    st.dataframe(
+                        pd.DataFrame({join_col_db: not_found_vals}),
+                        use_container_width=True, hide_index=True,
+                    )
+            st.balloons()
+        except Exception as exc:
+            log_action(
+                "bom_replace_by_join",
+                status="error",
+                payload={"table": target_table, "error": str(exc)},
+            )
+            st.error(f"❌ Gagal: {exc}")
     else:
         try:
             updated, not_found = bulk_update_by_join(
@@ -244,33 +451,8 @@ if update_btn:
             )
             st.success(f"✅ **{updated} baris** berhasil diupdate di `{target_table}`.")
             if not_found:
-                st.warning(
-                    f"⚠️ **{not_found} baris** tidak ditemukan di DB "
-                    f"(tidak ada {join_col_db} yang cocok)."
-                )
+                st.warning(f"⚠️ **{not_found} baris** tidak ditemukan di DB.")
             st.balloons()
-
-            # Show summary of not-found rows
-            if not_found:
-                # Find which join values did not match
-                updated_vals = set()
-                # Re-query to find what is in DB
-                try:
-                    from sqlalchemy import MetaData, Table, select as sa_select
-                    meta = MetaData()
-                    tbl = Table(target_table, meta, autoload_with=engine)
-                    with engine.connect() as conn:
-                        existing = {
-                            str(r[0])
-                            for r in conn.execute(sa_select(tbl.c[join_col_db])).fetchall()
-                        }
-                    missing_rows = [r for r in rows_to_update if str(r[join_col_db]) not in existing]
-                    if missing_rows:
-                        with st.expander(f"🔎 {len(missing_rows)} nilai tidak ditemukan di DB"):
-                            st.dataframe(_safe(pd.DataFrame(missing_rows)), use_container_width=True)
-                except Exception:
-                    pass
-
         except Exception as exc:
             log_action(
                 "bom_update_by_join",

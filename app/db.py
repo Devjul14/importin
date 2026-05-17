@@ -177,6 +177,100 @@ def insert_rows(
     raise ValueError(f"Unknown conflict_strategy: {conflict_strategy}")
 
 
+def bom_replace_by_join(
+    engine: Engine,
+    table_name: str,
+    rows: list[dict[str, Any]],
+    join_col: str,
+    carry_cols: list[str],
+    delete_col: str | None = None,
+) -> tuple[int, int, list[str]]:
+    """
+    Replace BOM rows in three atomic steps:
+
+    1. Look up carry_cols (e.g. id_produk, created_at) from DB keyed by join_col.
+       Only products FOUND in DB are processed; not-found are skipped safely.
+    2. DELETE existing rows using delete_col (e.g. id_produk) if provided,
+       otherwise by join_col (e.g. nama_produk). Only found products are deleted.
+    3. INSERT fresh rows from Excel with carry_cols merged in.
+
+    Returns (inserted, skipped, not_found_vals).
+    """
+    if not rows:
+        return 0, 0, []
+
+    from sqlalchemy import delete as sa_delete
+
+    metadata = MetaData()
+    tbl = Table(table_name, metadata, autoload_with=engine)
+
+    # ── 1. Collect unique join values from Excel rows ───────────
+    unique_vals = list({str(r[join_col]) for r in rows if r.get(join_col) is not None})
+
+    # ── 2. Fetch carry_cols + delete_col from DB ────────────────
+    valid_carry = [c for c in carry_cols if c in tbl.c.keys()]
+    fetch_extra = list(dict.fromkeys(
+        valid_carry +
+        ([delete_col] if delete_col and delete_col in tbl.c.keys() and delete_col not in valid_carry else [])
+    ))
+
+    carry_map: dict[str, dict[str, Any]] = {}
+    # Always query DB to confirm which join values actually exist,
+    # even when fetch_extra is empty (no carry cols selected).
+    fetch_cols = [tbl.c[join_col]] + [tbl.c[c] for c in fetch_extra]
+    with engine.connect() as conn:
+        result = conn.execute(
+            select(*fetch_cols).where(tbl.c[join_col].in_(unique_vals))
+        ).fetchall()
+    for r in result:
+        key = str(r[0])
+        if key not in carry_map:
+            carry_map[key] = {fetch_extra[i]: r[i + 1] for i in range(len(fetch_extra))}
+
+    not_found_vals = [v for v in unique_vals if v not in carry_map]
+    found_vals = [v for v in unique_vals if v in carry_map]
+
+    # ── 3. DELETE only found products ───────────────────────────
+    if found_vals:
+        if delete_col and delete_col in tbl.c.keys():
+            delete_ids = list({
+                carry_map[v][delete_col]
+                for v in found_vals
+                if carry_map[v].get(delete_col) is not None
+            })
+            if delete_ids:
+                with engine.begin() as conn:
+                    conn.execute(sa_delete(tbl).where(tbl.c[delete_col].in_(delete_ids)))
+        else:
+            with engine.begin() as conn:
+                conn.execute(sa_delete(tbl).where(tbl.c[join_col].in_(found_vals)))
+
+    # ── 4. INSERT — skip rows whose join_col not found in DB ────
+    not_found_set = set(not_found_vals)
+    insert_rows_list: list[dict[str, Any]] = []
+    for row in rows:
+        jv = str(row[join_col]) if row.get(join_col) is not None else None
+        if jv is None or jv in not_found_set:
+            continue
+        merged = dict(row)
+        for cc, cv in carry_map.get(jv, {}).items():
+            if cc not in merged or merged[cc] is None:
+                merged[cc] = cv
+        insert_rows_list.append(merged)
+
+    # Uniform keyset for SQLAlchemy bulk INSERT
+    if insert_rows_list:
+        all_keys: set[str] = set()
+        for r in insert_rows_list:
+            all_keys.update(r.keys())
+        insert_rows_list = [{k: r.get(k) for k in all_keys} for r in insert_rows_list]
+        with engine.begin() as conn:
+            conn.execute(insert(tbl), insert_rows_list)
+
+    skipped = sum(1 for r in rows if str(r.get(join_col, "")) in not_found_set)
+    return len(insert_rows_list), skipped, not_found_vals
+
+
 def bulk_update_by_join(
     engine: Engine,
     table_name: str,
